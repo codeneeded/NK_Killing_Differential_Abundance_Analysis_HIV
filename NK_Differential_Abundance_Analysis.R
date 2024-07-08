@@ -6,9 +6,14 @@ library(ggeffects)
 library(lmerTest)
 library(tidyr)
 library(reshape2)
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
 
 ########### Read in Data and Viral Data ############
-
+setwd("C:/Users/axi313/Documents/NK_Killing_Differential_Abundance_Analysis_HIV")
 data <- read_excel("NK Function Metadata.xlsx")
 v_data <- read.csv("Viral_Titres.csv")
 
@@ -77,7 +82,7 @@ names(data) <- gsub("viral_load", "viral load", names(data))
 
 data_cleaned <- data %>% select(-c(1, 3, 4))
 
-
+levels (as.factor(data_cleaned$PID))
 ######### Split Data based on Killing, MFI and Frequency ############
 
 col_names <- names(data_cleaned)
@@ -179,7 +184,10 @@ for(col in double_slash_cols) {
 # Update the dataframe column names to reflect the calculated values
 names(Freq) <- gsub("Total NK/", "", names(Freq))
 
+### Add Specific Killing to dataframes
 
+Freq$`specific killing` <- Killing$`specific killing`
+MFI$`specific killing` <- Killing$`specific killing`
 
 #### Split Datasets for Analysis #####
 
@@ -525,3 +533,630 @@ ggplot(preds_treatment, aes(x = x, y = predicted, color = x)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Improve x-axis label readability
 
+###### NK Freq Analysis #############
+# Removing the 'Group' column from both dataframes
+TARA_Freq$Group <- NULL
+
+# Get all column names
+column_names <- names(TARA_Freq)
+
+# Number of columns
+n_columns <- length(column_names)
+
+# Move the last column to be the 10th column
+# We create a sequence from the first to the (n_columns - 1) to exclude the last column initially,
+# then cbind the last column name at the 10th position.
+new_order <- c(column_names[-n_columns][1:9], column_names[n_columns], column_names[-n_columns][10:(n_columns-1)])
+
+# Rearrange the dataframe columns based on the new order
+TARA_Freq <- TARA_Freq[, new_order]
+
+# Round the values in the 'specific killing' column to two decimal points
+TARA_Freq$`specific killing` <- as.numeric(TARA_Freq$`specific killing`)
+TARA_Freq$`specific killing` <- round(TARA_Freq$`specific killing`, 2)
+
+TARA_Freq <- TARA_Freq %>%
+  filter(HIV != "HUU")
+
+TARA_Freq[, 11:ncol(TARA_Freq)] <- TARA_Freq[, 11:ncol(TARA_Freq)] / TARA_Freq$Count * 100
+TARA_Freq[, 11:ncol(TARA_Freq)] <- round(TARA_Freq[, 11:ncol(TARA_Freq)], 3)
+TARA_Freq <- TARA_Freq[, !apply(TARA_Freq == 0, 2, all)]
+
+### Differential Abundance analysis
+TARA_Freq_DA <- TARA_Freq[, !(names(TARA_Freq) %in% c("Batch", "age (yrs)", "Count", "P1", "P2", "P3", "P4", "specific killing"))]
+TARA_Freq_DA$Timepoint <- as.factor(TARA_Freq_DA$Timepoint)
+TARA_Freq_DA <- droplevels(TARA_Freq_DA)
+covariate_columns <- c("PID", "gender", "HIV", "viral load", "Timepoint", "Treatment")
+
+### Limma ####
+# Initialize a list to store results
+results_list <- list()
+
+# Loop over each combination of Treatment and Timepoint
+for (treatment in levels(TARA_Freq_DA$Treatment)) {
+  for (timepoint in levels(TARA_Freq_DA$Timepoint)) {
+    
+    # Subset data for current treatment and timepoint
+    current_data <- TARA_Freq_DA[TARA_Freq_DA$Treatment == treatment & TARA_Freq_DA$Timepoint == timepoint,]
+    names(current_data)[names(current_data) == "viral load"] <- "viral_load"
+    current_data <- na.omit(current_data)
+    
+    # Check if there are enough data points to proceed
+    if(nrow(current_data) > 1){
+      # Design matrix including intercept
+      design <- model.matrix(~ 0+ HIV + gender + viral_load, data = current_data)
+
+      # Voom transformation
+      v <- voom(t(current_data[, !(names(current_data) %in% c("PID", "gender", "HIV", "viral_load", "Timepoint", "Treatment"))]), 
+                design, plot = FALSE)
+      
+      # Fit the linear model
+      fit <- lmFit(v, design)
+
+      # Contrast for HIV positive vs. negative
+      contrast.matrix <- makeContrasts(HIVpositive - HIVnegative, levels=design)
+      
+      # Apply contrasts
+      fit2 <- contrasts.fit(fit, contrast.matrix)
+      fit2 <- eBayes(fit2)
+      # Store results
+      results_list[[paste(treatment, timepoint, sep="_")]] <- topTable(fit2, adjust="BH", number=1000)
+      
+    }
+  }
+}
+
+## VOlcano Plots
+results_list$HUT78_12$feature<- rownames(results_list$HUT78_12)
+results_list$HUT78_12$abs_logFC<- abs(results_list$HUT78_12$logFC)
+
+
+
+HUT78_12_volcano_plot <- ggplot(results_list$HUT78_12, aes(x = logFC, y = -log10(P.Value), text = paste("Cell Type:", feature, "<br>LogFC:", logFC, "<br>Adj. P-Val:", adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), alpha = 0.5) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey50")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot Dendritic Cell Fold Change HEI Vs HEU", x = "Log2 Fold Change (HEI vs HEU)", y = "-Log10 P-value")
+
+HUT78_12_volcano_plot
+
+# Convert the ggplot object to a plotly object
+HUT78_12_volcano_plot <- ggplotly(HUT78_12_volcano_plot, tooltip = "text")
+
+# Print the interactive plot object to display it in the RMarkdown HTML output
+HUT78_12_volcano_plot
+
+
+#### Mixed Effects Models ####
+library(tidyverse)
+
+filter_top_effects <- function(data_frame) {
+  positive_effects <- data_frame %>% 
+    arrange(desc(Estimate)) %>% 
+    head(35)
+  
+  negative_effects <- data_frame %>% 
+    arrange(Estimate) %>% 
+    head(35)
+  
+  bind_rows(positive_effects, negative_effects)
+}
+TARA_Freq_M <- TARA_Freq[, !(names(TARA_Freq) %in% c("Batch", "age (yrs)", "Count", "P1", "P2", "P3", "P4"))]
+
+# Initialize an empty list to store intermediate dataframes
+merge_treatment_killing <- function(main_df, treatment_df, treatment_name) {
+  # Create a unique key by pasting PID and Timepoint
+  main_df$key <- paste(main_df$PID, main_df$Timepoint)
+  treatment_df$key <- paste(treatment_df$PID, treatment_df$Timepoint)
+  
+  # Rename the specific killing column in the treatment dataframe
+  col_name <- paste0("specific_killing_", treatment_name)
+  names(treatment_df)[names(treatment_df) == paste0("specific_killing_", treatment_name)] <- col_name
+  
+  # Merge based on the unique key
+  enriched_df <- left_join(main_df, treatment_df[c("key", col_name)], by = "key")
+  
+  # Remove the key column to clean up
+  enriched_df$key <- NULL
+  
+  return(enriched_df)
+}
+unique_treatments <- unique(TARA_Freq_M$Treatment)
+
+# Applying the function for each treatment
+TARA_Freq_M_enriched <- TARA_Freq_M
+
+for(treatment in unique_treatments) {
+  # Prepare the treatment-specific dataframe
+  specific_treatment_df <- TARA_Freq_M %>%
+    filter(Treatment == treatment) %>%
+    select(PID, Timepoint, `specific killing`) %>%
+    mutate(!!paste0("specific_killing_", treatment) := `specific killing`) %>%
+    select(-`specific killing`) # We don't need the Treatment column anymore
+  
+  # Merge this treatment's killing values into the main dataframe
+  TARA_Freq_M_enriched <- merge_treatment_killing(TARA_Freq_M_enriched, specific_treatment_df, treatment)
+}
+
+# Number of columns in the dataframe
+num_cols <- ncol(TARA_Freq_M_enriched)
+
+# Create a vector with the new column order
+# First 8 columns + last 8 columns moved to 9th position + remaining columns
+new_order <- c(1:8, (num_cols-7):num_cols, 9:(num_cols-8))
+
+# Reorder the columns based on the new order
+TARA_Freq_M_enriched <- TARA_Freq_M_enriched[, new_order]
+
+### Subset untreated 
+untreated_df <- TARA_Freq_M_enriched %>%
+  filter(Treatment == "untreated")
+filtered_df <- untreated_df %>%
+  filter(!is.na(specific_killing_HUT78) & !is.na(specific_killing_K562))
+
+fixed_part_of_formula <- "~ `viral load` + Timepoint  + gender + HIV + specific_killing_HUT78 + specific_killing_K562 + (1 | PID)"
+
+## HIV Effect
+
+# Initialize lists to store results
+models_list <- list()
+percentage_columns <- colnames(filtered_df[17:ncol(filtered_df)])
+
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in percentage_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(escaped_subset_name, fixed_part_of_formula)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = filtered_df)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                                   Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  results_df <- rbind(results_df, df)
+}
+
+results_df <- results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+HIV_effects <- results_df %>% filter(Effect == "HIVpositive")
+HIV_effects$Significance <- ifelse(HIV_effects$P.Value < 0.05, "*", "")
+HIV_effects <- HIV_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+ggplot(filter_top_effects(HIV_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of HIV Status", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+Gender_effects <- results_df %>% filter(Effect == "gendermale")
+Gender_effects$Significance <- ifelse(Gender_effects$P.Value < 0.05, "*", "")
+Gender_effects <- Gender_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+Timepoint_effects <- results_df %>% filter(Effect == "TimepointEntry")
+Timepoint_effects$Significance <- ifelse(Timepoint_effects$P.Value < 0.05, "*", "")
+Timepoint_effects <- Timepoint_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+
+
+HUT78 <- results_df %>% filter(Effect == "specific_killing_HUT78")
+HUT78$Significance <- ifelse(HUT78$P.Value < 0.05, "*", "")
+HUT78 <- HUT78 %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+
+K562 <- results_df %>% filter(Effect == "specific_killing_K562")
+K562$Significance <- ifelse(K562$P.Value < 0.05, "*", "")
+K562 <- K562 %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+#########
+ggplot(filter_top_effects(Gender_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Gender", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+ggplot(filter_top_effects(Timepoint_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Timepoint", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of HUT78", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+ggplot(filter_top_effects(K562), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of K562", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+#### Mixed Model for k562 and Hut78
+
+HUT78_df <- TARA_Freq_M_enriched %>%
+  filter(Treatment == "HUT78")
+K562_df <- TARA_Freq_M_enriched %>%
+  filter(Treatment == "K562")
+
+h_fixed_part_of_formula <- "~ `viral load` + Timepoint  + gender + HIV + specific_killing_HUT78  + (1 | PID)"
+k_fixed_part_of_formula <- "~ `viral load` + Timepoint  + gender + HIV + specific_killing_K562  + (1 | PID)"
+
+
+# Initialize lists to store results
+h_models_list <- list()
+k_models_list <- list()
+
+h_percentage_columns <- colnames(HUT78_df[17:ncol(HUT78_df)])
+k_percentage_columns <- colnames(K562_df[17:ncol(K562_df)])
+
+### Model for HUT78
+
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in h_percentage_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(escaped_subset_name, h_fixed_part_of_formula)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = HUT78_df)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    h_models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+h_results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(h_models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  h_results_df <- rbind(h_results_df, df)
+}
+
+### Model for K562
+
+### Model for HUT78
+
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in k_percentage_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(escaped_subset_name, k_fixed_part_of_formula)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = K562_df)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    k_models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+k_results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                           Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(k_models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  k_results_df <- rbind(k_results_df, df)
+}
+
+####################
+
+k_results_df <- k_results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+h_results_df <- h_results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+
+### K Results
+
+HIV_effects <- k_results_df %>% filter(Effect == "HIVpositive")
+HIV_effects$Significance <- ifelse(HIV_effects$P.Value < 0.05, "*", "")
+HIV_effects <- HIV_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+Gender_effects <- k_results_df %>% filter(Effect == "gendermale")
+Gender_effects$Significance <- ifelse(Gender_effects$P.Value < 0.05, "*", "")
+Gender_effects <- Gender_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+Timepoint_effects <- k_results_df %>% filter(Effect == "TimepointEntry")
+Timepoint_effects$Significance <- ifelse(Timepoint_effects$P.Value < 0.05, "*", "")
+Timepoint_effects <- Timepoint_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+K562 <- k_results_df %>% filter(Effect == "specific_killing_K562")
+K562$Significance <- ifelse(K562$P.Value < 0.05, "*", "")
+K562 <- K562 %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+#########
+
+ggplot(filter_top_effects(HIV_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of HIV Status", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+
+ggplot(filter_top_effects(Gender_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Gender", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+ggplot(filter_top_effects(Timepoint_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Timepoint", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+ggplot(filter_top_effects(K562), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of K562", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+### H effect
+
+
+HIV_effects <- h_results_df %>% filter(Effect == "HIVpositive")
+HIV_effects$Significance <- ifelse(HIV_effects$P.Value < 0.05, "*", "")
+HIV_effects <- HIV_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+Gender_effects <- h_results_df %>% filter(Effect == "gendermale")
+Gender_effects$Significance <- ifelse(Gender_effects$P.Value < 0.05, "*", "")
+Gender_effects <- Gender_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+Timepoint_effects <- h_results_df %>% filter(Effect == "TimepointEntry")
+Timepoint_effects$Significance <- ifelse(Timepoint_effects$P.Value < 0.05, "*", "")
+Timepoint_effects <- Timepoint_effects %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+
+
+
+HUT78 <- h_results_df %>% filter(Effect == "specific_killing_HUT78")
+HUT78$Significance <- ifelse(HUT78$P.Value < 0.05, "*", "")
+HUT78 <- HUT78 %>%
+  mutate(Color = ifelse(Estimate > 0, "lightblue", "lightgreen"),
+         Significance = ifelse(P.Value < 0.05, "*", ""))
+#########
+
+ggplot(filter_top_effects(HIV_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of HIV Status", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+
+ggplot(filter_top_effects(Gender_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Gender", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+ggplot(filter_top_effects(Timepoint_effects), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Timepoint", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+
+
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of HUT78", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+
+### Volcano Effect of IL15
+
+
+### Limma
+
+
+# Initialize a list to store results
+results_list <- list()
+
+# Define pairs of treatments to compare
+treatment_pairs <- list(
+  "CEM" = "CEM+IL15",
+  "HUT78" = "HUT78+IL15",
+  "K562" = "K562+IL15"
+)
+# Process each treatment pair
+for (baseline in names(treatment_pairs)) {
+  treated <- treatment_pairs[[baseline]]
+  
+  # Filter data for only the current pair of treatments
+  pair_data <- TARA_Freq_DA[TARA_Freq_DA$Treatment %in% c(baseline, treated), ]
+  
+  # Create a factor to distinguish between baseline and treated groups
+  pair_data$group <- factor(ifelse(pair_data$Treatment == baseline, "baseline", "treated"))
+  names(pair_data)[names(pair_data) == "viral load"] <- "viral_load"
+  # Check if there are enough data points to proceed
+  if(nrow(pair_data) > 1) {
+    # Design matrix including Timepoint as a factor and HIV status
+    design <- model.matrix(~0+ group + Timepoint + HIV  +viral_load, data = pair_data)
+    
+    # Voom transformation
+    v <- voom(t(pair_data[, !(names(pair_data) %in% c("PID", "HIV", "gender", "Timepoint","viral_load", "Treatment", "group"))]), 
+              design, plot = FALSE)
+    
+    # Fit the linear model
+    corfit <- duplicateCorrelation(v, design, block = pair_data$PID)
+    fit <- lmFit(v, design, block = pair_data$PID, correlation = corfit$consensus)
+    
+    # Specify the correct contrast based on the baseline and treated groups
+    contrast.matrix <- makeContrasts(grouptreated - groupbaseline, levels = design)
+    
+    # Apply contrasts
+    fit2 <- contrasts.fit(fit, contrast.matrix)
+    fit2 <- eBayes(fit2)
+    
+    # Store results, specifying treatment pair
+    results_key <- paste(baseline, "vs", treated, sep="_")
+    results_list[[results_key]] <- topTable(fit2, adjust="BH", number=1000)
+  }
+}
+
+
+## VOlcano Plots
+results_list$`CEM_vs_CEM+IL15`$feature<- rownames(results_list$`CEM_vs_CEM+IL15`)
+results_list$`CEM_vs_CEM+IL15`$abs_logFC<- abs(results_list$`CEM_vs_CEM+IL15`$logFC)
+
+results_list$`HUT78_vs_HUT78+IL15`$feature<- rownames(results_list$`HUT78_vs_HUT78+IL15`)
+results_list$`HUT78_vs_HUT78+IL15`$abs_logFC<- abs(results_list$`HUT78_vs_HUT78+IL15`$logFC)
+
+results_list$`K562_vs_K562+IL15`$feature<- rownames(results_list$`K562_vs_K562+IL15`)
+results_list$`K562_vs_K562+IL15`$abs_logFC<- abs(results_list$`K562_vs_K562+IL15`$logFC)
+
+
+CEM_volcano_plot <- ggplot(results_list$`CEM_vs_CEM+IL15`, aes(x = logFC, y = -log10(P.Value), text = paste("Cell Type:", feature, "<br>LogFC:", logFC, "<br>Adj. P-Val:", adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), alpha = 0.5) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey50")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot NK Cell Fold Change  CEM+IL15 vs CEM", x = "Log2 Fold Change (CEM+IL15 vs CEM)", y = "-Log10 P-value")
+
+CEM_volcano_plot <- ggplotly(CEM_volcano_plot, tooltip = "text")
+
+CEM_volcano_plot
