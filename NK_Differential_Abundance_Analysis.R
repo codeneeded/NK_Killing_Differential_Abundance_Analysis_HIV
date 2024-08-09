@@ -11,12 +11,12 @@ library(edgeR)
 library(ggplot2)
 library(ggrepel)
 library(plotly)
-
+library(broom.mixed)
 ########### Read in Data and Viral Data ############
-setwd("C:/Users/axi313/Documents/NK_Killing_Differential_Abundance_Analysis_HIV")
-data <- read_excel("NK Function Metadata.xlsx")
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV")
+data <- read_excel("NK Function MetaDATA_REVISED0724v2.xlsx", col_names = TRUE)
 v_data <- read.csv("Viral_Titres.csv")
-
+str(data)
 ########## Clean Column Names and Delete uneeded columns ##############
 
 # Preliminary setup
@@ -83,13 +83,14 @@ names(data) <- gsub("viral_load", "viral load", names(data))
 data_cleaned <- data %>% select(-c(1, 3, 4))
 
 levels (as.factor(data_cleaned$PID))
-######### Split Data based on Killing, MFI and Frequency ############
+
+######### Split Data based on MFI and Frequency ############
 
 col_names <- names(data_cleaned)
 col_names_excluding_killing <- col_names[-((ncol(data_cleaned)-2):ncol(data_cleaned))]
 
 # Identify indices for the shared first 9 columns and the last 3 columns
-shared_cols <- 1:10
+shared_cols <- 1:11
 killing_additional_cols <- (ncol(data_cleaned)-2):ncol(data_cleaned) # Last 3 columns
 
 # Identify columns for MFI and Freq excluding the last three columns
@@ -101,30 +102,18 @@ mfi_indices <- match(col_names_excluding_killing[mfi_cols], col_names)
 freq_indices <- match(col_names_excluding_killing[freq_cols], col_names)
 
 # Creating the dataframes
-Killing <- data_cleaned[, c(shared_cols, (ncol(data_cleaned)-2):ncol(data_cleaned))]
-MFI <- data_cleaned[, unique(c(shared_cols, mfi_indices))]
-Freq <- data_cleaned[, unique(c(shared_cols, freq_indices))]
+MFI <- data_cleaned[, unique(c(shared_cols,killing_additional_cols, mfi_indices))]
+Freq <- data_cleaned[, unique(c(shared_cols, killing_additional_cols,freq_indices))]
 
+#### Clean Frequency Dataset prior to Splitting, and convert % to raw counts ########
+# Replace portions of column names
+colnames(Freq) <- gsub('Lymphocytes/Single Cells/Live/CD3-Label-/Total NK', 'Total NK', colnames(Freq))
+colnames(Freq) <- gsub('Lymphocytes/Single Cells/Live/CD3-Label-', 'P4', colnames(Freq))
+colnames(Freq) <- gsub('Lymphocytes/Single Cells/Live', 'P3', colnames(Freq))
+colnames(Freq) <- gsub('Lymphocytes/Single Cells', 'P2', colnames(Freq))
+colnames(Freq) <- gsub('Lymphocytes', 'P1', colnames(Freq))
 
-### Clean Frequency Dataset prior to Splitting, and convert % to raw counts ########
 names(Freq) <- gsub(" \\| Freq\\. of Parent \\(%\\)", "", names(Freq))
-rename_map <- c(
-  "Lymphocytes" = "P1",
-  "Lymphocytes/Single Cells" = "P2",
-  "Lymphocytes/Single Cells/Live" = "P3",
-  "Lymphocytes/Single Cells/Live/CD3-Label-" = "P4"
-)
-
-# Loop through the rename map and assign new names to Freq dataframe
-for(original_name in names(rename_map)) {
-  # Check if the original_name exists in the column names of Freq
-  if(original_name %in% names(Freq)) {
-    # Get the index of the column with the original name
-    col_index <- which(names(Freq) == original_name)
-    # Assign the new name to the column
-    names(Freq)[col_index] <- rename_map[original_name]
-  }
-}
 
 # Convert percentages to actual values
 Freq$P1 <- Freq$Count * (Freq$P1 / 100) # P1 as a percentage of Count
@@ -150,21 +139,58 @@ Freq[non_numeric_cols] <- lapply(Freq[non_numeric_cols], function(x) as.numeric(
 # Verify changes
 str(Freq[non_numeric_cols])
 
-# Impute NA Values
+######## Split based on cohort ###########
+
+# Split the dataframe based on the Group column
+split_Freq <- split(Freq, Freq$Group)
+
+# Access the dataframe for "Florah"
+florah_Freq <- split_Freq[["Florah"]]
+
+# Access the dataframe for "PAVE KL"
+pave_kl_Freq <- split_Freq[["PAVE KL"]]
+
+# Access the dataframe for "TARA"
+tara_Freq <- split_Freq[["TARA"]]
+
+
+#### Impute NA Values #########
+
+
+
 # Columns to impute (example; adjust as needed)
 columns_to_impute <- c("Total NK", single_slash_cols, double_slash_cols)
 
+# Tara
+
 # Impute NAs based on the median for the HIV status group
-Freq <- Freq %>%
+tara_Freq <- tara_Freq %>%
+  mutate(across(all_of(columns_to_impute), ~if_else(is.na(.),
+                                                    ave(., HIV, FUN = function(x) median(x, na.rm = TRUE)),
+                                                    .),
+                .names = "{.col}"))
+
+# Florah
+florah_Freq <- florah_Freq %>%
+  mutate(across(all_of(columns_to_impute), ~if_else(is.na(.),
+                                                    ave(., HIV, FUN = function(x) median(x, na.rm = TRUE)),
+                                                    .),
+                .names = "{.col}"))
+# Pave Kl
+
+pave_kl_Freq <- pave_kl_Freq %>%
   mutate(across(all_of(columns_to_impute), ~if_else(is.na(.),
                                                     ave(., HIV, FUN = function(x) median(x, na.rm = TRUE)),
                                                     .),
                 .names = "{.col}"))
 
 
+
 # Step 2: Calculate values for direct subsets of "Total NK"
+
+# Tara
 for(col in single_slash_cols) {
-  Freq[[col]] <- Freq[["Total NK"]] * (Freq[[col]] / 100)
+  tara_Freq[[col]] <- tara_Freq[["Total NK"]] * (tara_Freq[[col]] / 100)
 }
 
 
@@ -175,66 +201,763 @@ for(col in double_slash_cols) {
   parent_subset_name <- paste(parts[1:length(parts)-1], collapse="/")
   
   # Ensure parent_subset_name is in single_slash_cols or double_slash_cols
-  if(parent_subset_name %in% names(Freq)) {
-    parent_value <- Freq[[parent_subset_name]]
-    Freq[[col]] <- parent_value * (Freq[[col]] / 100)
+  if(parent_subset_name %in% names(tara_Freq)) {
+    parent_value <- tara_Freq[[parent_subset_name]]
+    tara_Freq[[col]] <- parent_value * (tara_Freq[[col]] / 100)
   }
 }
 
 # Update the dataframe column names to reflect the calculated values
-names(Freq) <- gsub("Total NK/", "", names(Freq))
+names(tara_Freq) <- gsub("Total NK/", "", names(tara_Freq))
 
-### Add Specific Killing to dataframes
+# Florah
+for(col in single_slash_cols) {
+  florah_Freq[[col]] <- florah_Freq[["Total NK"]] * (florah_Freq[[col]] / 100)
+}
 
-Freq$`specific killing` <- Killing$`specific killing`
-MFI$`specific killing` <- Killing$`specific killing`
 
-#### Split Datasets for Analysis #####
+# Srep 3 Double / cols
+for(col in double_slash_cols) {
+  # Extract the parent subset name from the column name
+  parts <- strsplit(col, "/")[[1]]
+  parent_subset_name <- paste(parts[1:length(parts)-1], collapse="/")
+  
+  # Ensure parent_subset_name is in single_slash_cols or double_slash_cols
+  if(parent_subset_name %in% names(florah_Freq)) {
+    parent_value <- florah_Freq[[parent_subset_name]]
+    florah_Freq[[col]] <- parent_value * (florah_Freq[[col]] / 100)
+  }
+}
 
-TARA_Killing <- subset(Killing, Group == "TARA")
-TARA_MFI <- subset(MFI, Group == "TARA")
-TARA_Freq <- subset(Freq, Group == "TARA")
-Florah_Killing <- subset(Killing, Group == "Florah")
-Florah_MFI <- subset(MFI, Group == "Florah")
-Florah_Freq <- subset(Freq, Group == "Florah")
+# Update the dataframe column names to reflect the calculated values
+names(florah_Freq) <- gsub("Total NK/", "", names(florah_Freq))
+
+# Pave KL
+for(col in single_slash_cols) {
+  pave_kl_Freq[[col]] <- pave_kl_Freq[["Total NK"]] * (pave_kl_Freq[[col]] / 100)
+}
+
+
+# Srep 3 Double / cols
+for(col in double_slash_cols) {
+  # Extract the parent subset name from the column name
+  parts <- strsplit(col, "/")[[1]]
+  parent_subset_name <- paste(parts[1:length(parts)-1], collapse="/")
+  
+  # Ensure parent_subset_name is in single_slash_cols or double_slash_cols
+  if(parent_subset_name %in% names(pave_kl_Freq)) {
+    parent_value <- pave_kl_Freq[[parent_subset_name]]
+    pave_kl_Freq[[col]] <- parent_value * (pave_kl_Freq[[col]] / 100)
+  }
+}
+
+# Update the dataframe column names to reflect the calculated values
+names(pave_kl_Freq) <- gsub("Total NK/", "", names(pave_kl_Freq))
+
+### Standardise all values to Total NK
+
+# Step 1: Identify the `Total NK` column
+total_nk_col <- tara_Freq$`Total NK`
+
+# Step 2: Convert values after column 19 to percentages of `Total NK`
+tara_Freq[, 20:ncol(tara_Freq)] <- round(tara_Freq[, 20:ncol(tara_Freq)] / total_nk_col * 100,2)
+
 
 ###### NK KILLING Analysis #############
 
 ### Cleaning Dataframe ###
 
-# Removing the 'Group' column from both dataframes
-TARA_Killing$Group <- NULL
-TARA_Killing <- TARA_Killing %>%
-  filter(`specific killing` != "n/a")
 
-# Round the values in the 'specific killing' column to two decimal points
-TARA_Killing$`specific killing` <- as.numeric(TARA_Killing$`specific killing`)
-TARA_Killing$`specific killing` <- round(TARA_Killing$`specific killing`, 2)
+tara_Freq$Treatment <- droplevels(tara_Freq$Treatment)
+levels(tara_Freq$Treatment)
 
-TARA_Killing <- TARA_Killing %>%
+#### Seperate HUT Data
+
+
+
+# Separate the HUT data
+TARA_HUT78_Freq <- tara_Freq %>%
+  filter(Treatment == "HUT78")
+
+# Filter unneeded columna
+TARA_HUT78_Freq$Group <- NULL
+TARA_HUT78_Freq$`age group` <- NULL
+TARA_HUT78_Freq$`age (yrs)` <- NULL
+TARA_HUT78_Freq$Target <- NULL
+TARA_HUT78_Freq$`Target/Dead`<- NULL
+TARA_HUT78_Freq$Timepoint <- as.factor(TARA_HUT78_Freq$Timepoint)
+TARA_HUT78_Freq$Timepoint <- factor(TARA_HUT78_Freq$Timepoint, levels = rev(levels(TARA_HUT78_Freq$Timepoint)))
+
+TARA_HUT78_Freq <- TARA_HUT78_Freq %>%
   filter(HIV != "HUU")
 
-# Remove Unneeded Columns
+# Clean
 
-TARA_Killing <- TARA_Killing[, -c(ncol(TARA_Killing)-2, ncol(TARA_Killing)-1)]
-
-TARA_Killing <- TARA_Killing[, -which(names(TARA_Killing) == "age (yrs)")]
-
-TARA_Killing <- droplevels(TARA_Killing)
+TARA_HUT78_Freq <- TARA_HUT78_Freq[!is.na(TARA_HUT78_Freq$`Specific Killing`), ]
+TARA_HUT78_Freq <- droplevels(TARA_HUT78_Freq)
+TARA_HUT78_Freq$`Specific Killing`<- as.numeric(TARA_HUT78_Freq$`Specific Killing`)
+TARA_HUT78_Freq$`Specific Killing`<- round(TARA_HUT78_Freq$`Specific Killing`, 2)
 
 
 # Standardize the 'viral load' variable because of high values
 
-TARA_Killing$`viral load` <- scale(TARA_Killing$`viral load`)
-str(TARA_Killing)
+TARA_HUT78_Freq$`viral load` <- scale(TARA_HUT78_Freq$`viral load`)
 
+# List of columns representing flow populations, starting from column 13 onwards
+flow_population_columns <- colnames(TARA_HUT78_Freq)[15:ncol(TARA_HUT78_Freq)] 
+
+
+filter_top_effects <- function(data_frame) {
+  positive_effects <- data_frame %>% 
+    arrange(desc(Estimate)) %>% 
+    head(35)
+  
+  negative_effects <- data_frame %>% 
+    arrange(Estimate) %>% 
+    head(35)
+  
+  bind_rows(positive_effects, negative_effects)
+}
+##### FLOW HUT #######
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/Mixed_Model_Plots")
+# Initialize lists to store results
+x <- lmer(" `Specific Killing` ~ `viral load` + Timepoint  + gender + HIV  + (1 | PID)", data = TARA_HUT78_Freq)
+summary(x)
+models_list <- list()
+fixed_part_of_formula <- "`Specific Killing` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in flow_population_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = TARA_HUT78_Freq)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  results_df <- rbind(results_df, df)
+}
+df
+results_df <- results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
+filtered_results_df <- results_df %>% 
+  filter(Effect %in% escaped_subset_names)
+
+
+
+# Filter the results to include only significant effects
+HUT78 <- filtered_results_df %>%
+  filter(P.Value < 0.05) %>%
+  mutate(Significance = "*",
+         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets onHUT78 Specific Killing (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Flow_Effects_on_Specific_Killing_HUT78_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+##### IFNg HUT #######
+models_list <- list()
+fixed_part_of_formula <- "`CD56dimCD16+/IFNy` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in flow_population_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = TARA_HUT78_Freq)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  results_df <- rbind(results_df, df)
+}
+df
+results_df <- results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
+filtered_results_df <- results_df %>% 
+  filter(Effect %in% escaped_subset_names)
+
+
+
+# Filter the results to include only significant effects
+HUT78 <- filtered_results_df %>%
+  filter(P.Value < 0.05) %>%
+  mutate(Significance = "*",
+         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/IFNy` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Flow_Effects_on_IFNy_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+##### CD56dimCD16+/MIP-1B HUT #######
+# Initialize lists to store results
+
+models_list <- list()
+fixed_part_of_formula <- "`CD56dimCD16+/MIP-1B` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in flow_population_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = TARA_HUT78_Freq)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  results_df <- rbind(results_df, df)
+}
+df
+results_df <- results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
+filtered_results_df <- results_df %>% 
+  filter(Effect %in% escaped_subset_names)
+
+
+
+# Filter the results to include only significant effects
+HUT78 <- filtered_results_df %>%
+  filter(P.Value < 0.05) %>%
+  mutate(Significance = "*",
+         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/MIP-1B` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Flow_Effects_on_MIP-1B_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+
+
+##### CD56dimCD16+/CD107A HUT #######
+# Initialize lists to store results
+models_list <- list()
+fixed_part_of_formula <- "`CD56dimCD16+/CD107a` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in flow_population_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = TARA_HUT78_Freq)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  results_df <- rbind(results_df, df)
+}
+df
+results_df <- results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
+filtered_results_df <- results_df %>% 
+  filter(Effect %in% escaped_subset_names)
+
+
+
+# Filter the results to include only significant effects
+HUT78 <- filtered_results_df %>%
+  filter(P.Value < 0.05) %>%
+  mutate(Significance = "*",
+         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/CD107a` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Flow_Effects_on_CD107a_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+
+### Effect of HIV Status #######
+
+models_list <- list()
+fixed_part_of_formula <- "HIV ~ `viral load` + Timepoint  + gender + (1 | PID)"
+# Loop through each  subset, ensuring column names are correctly handled
+for (subset_name in flow_population_columns) {
+  # Escape subset_name if it contains special characters
+  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+  
+  # Construct the formula string with escaped column names
+  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
+  
+  # Convert the string to a formula
+  current_formula <- as.formula(formula_str)
+  
+  
+  # Fit the model using the current formula
+  model <- tryCatch({
+    lmer(current_formula, data = TARA_HUT78_Freq)
+  }, error = function(e) {
+    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+    return(NULL)  # Return NULL if there was an error fitting the model
+  })
+  
+  # Store the model if successfully fitted
+  if (!is.null(model)) {
+    models_list[[subset_name]] <- model
+  }
+}
+
+# Initialize an empty data frame to store the results
+results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each model to extract information
+for (subset_name in names(models_list)) {
+  model <- models_list[[subset_name]]
+  summary_model <- summary(model)
+  df <- as.data.frame(summary_model$coefficients)
+  df$Subset <- subset_name
+  df$Effect <- rownames(df)
+  results_df <- rbind(results_df, df)
+}
+df
+results_df <- results_df %>% 
+  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+
+escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
+filtered_results_df <- results_df %>% 
+  filter(Effect %in% escaped_subset_names)
+
+
+
+# Filter the results to include only significant effects
+HUT78 <- filtered_results_df %>%
+  filter(P.Value < 0.05) %>%
+  mutate(Significance = "*",
+         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/IFNy` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Flow_Effects_on_IFNy_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+
+
+
+
+
+
+
+
+
+
+###########
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######
+# Collect results for each flow population
+TARA_results_HUT_flow <- list()
+for (flow_col in flow_population_columns) {
+  model_summary <- run_model_flow(TARA_HUT78_Freq, flow_col)
+  TARA_results_HUT_flow[[flow_col]] <- model_summary
+}
+
+# Combine results into a single dataframe
+TARA_flow_HUT_df <- do.call(rbind, lapply(names(TARA_results_HUT_flow), function(flow_col) {
+  df <- TARA_results_HUT_flow[[flow_col]]
+  df$FlowPop <- flow_col
+  return(df)
+}))
+
+# Filter results for fixed effects (excluding intercept) and significant effects (p < 0.05)
+TARA_flow_HUT_plot <- TARA_flow_HUT_df %>%
+  filter(term != "(Intercept)" & p.value < 0.05)
+
+# Select top 10 positive and top 10 negative effects
+top_positive_results <- TARA_flow_HUT_plot %>%
+  arrange(desc(estimate)) %>%
+  slice(1:10)
+
+top_negative_results <- TARA_flow_HUT_plot %>%
+  arrange(estimate) %>%
+  slice(1:10)
+
+top_results_df <- bind_rows(top_positive_results, top_negative_results)
+
+# Add significance stars and color coding
+top_results_df <- top_results_df %>%
+  mutate(significance = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01 ~ "**",
+    p.value < 0.05 ~ "*",
+    TRUE ~ ""
+  ),
+  Color = ifelse(estimate > 0, "lightblue", "lightgreen"))
+
+# Plot the results with significance stars and error bars
+ggplot(top_results_df, aes(x = reorder(FlowPop, estimate), y = estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error), width = 0.4) +
+  geom_text(aes(label = significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Top 10  Significant Effects of Flow Populations on HUT78 Specific Killing",
+       x = "Flow Cytometry Gated Populations",
+       y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################################################################################################
+###
+# Separate the untreated data
+untreated_data <- tara_Freq %>%
+  filter(Treatment == "untreated")
+
+# Create a function to merge specific killing values for each treatment
+merge_specific_killing <- function(data, treatment) {
+  data %>%
+    left_join(
+      tara_Freq %>%
+        filter(Treatment == treatment) %>%
+        select(PID, Timepoint, !!paste0(treatment, "_Specific_Killing") := `Specific Killing`),
+      by = c("PID", "Timepoint")
+    )
+}
+
+# List of treatments to be added as columns
+treatments <- levels(tara_Freq$Treatment)[levels(tara_Freq$Treatment) != "untreated"]
+
+# Loop over each treatment and merge specific killing values
+TARA_Killing <- untreated_data
+for (treatment in treatments) {
+  TARA_Killing <- merge_specific_killing(TARA_Killing, treatment)
+}
+
+# Removing NA specific Killings as well as redundant columns
+
+
+TARA_Killing$Group <- NULL
+TARA_Killing$`age group` <- NULL
+TARA_Killing$`age (yrs)` <- NULL
+TARA_Killing$Target <- NULL
+TARA_Killing$`Target/Dead`<- NULL
 TARA_Killing$Timepoint <- as.factor(TARA_Killing$Timepoint)
 TARA_Killing$Timepoint <- factor(TARA_Killing$Timepoint, levels = rev(levels(TARA_Killing$Timepoint)))
+TARA_Killing$`Specific Killing`<-NULL
+
+TARA_Killing <- TARA_Killing %>%
+  filter(HIV != "HUU")
+
+# Round the values in the 'specific killing' column to two decimal points
+TARA_Killing$`Specific Killing` <- as.numeric(TARA_Killing$`Specific Killing`)
+TARA_Killing$`Specific Killing` <- round(TARA_Killing$`Specific Killing`, 2)
+
+### Fix missing VL Value
+# Update the Viral_Load column for PID CP018 at Timepoint entry
+TARA_Killing <- TARA_Killing %>%
+  mutate(`viral load` = ifelse(PID == "CP018" & Timepoint == "Entry", 176970, `viral load`))
+
+
+
+
 
 #### Fit the mixed effects model for each treatment condition ####
 
 # Define the treatment levels
 treatments <- levels(TARA_Killing$Treatment)
+
+######## Unstimulated ###############
+
+#### Mixed effect model using HUT specific killing as outcome variable ####
+
+# Determine the columns to keep
+columns_to_keep <- c(1:(ncol(TARA_Killing) - 7), which(colnames(TARA_Killing) == "HUT78_Specific_Killing"))
+
+# Subset the dataframe
+TARA_Killing_HUT <- TARA_Killing[, columns_to_keep]
+# Remove rows with NA in HUT78_Specific_Killing column using base R
+TARA_Killing_HUT <- TARA_Killing_HUT[!is.na(TARA_Killing_HUT$HUT78_Specific_Killing), ]
+TARA_Killing_HUT <- droplevels(TARA_Killing_HUT)
+TARA_Killing_HUT$HUT78_Specific_Killing<- as.numeric(TARA_Killing_HUT$HUT78_Specific_Killing)
+TARA_Killing_HUT$HUT78_Specific_Killing<- round(TARA_Killing_HUT$HUT78_Specific_Killing, 2)
+
+# Standardize the 'viral load' variable because of high values
+
+TARA_Killing_HUT$`viral load` <- scale(TARA_Killing_HUT$`viral load`)
+
+# List of columns representing flow populations, starting from column 13 onwards
+flow_population_columns <- colnames(TARA_Killing_HUT)[13:(ncol(TARA_Killing_HUT) - 1)] 
+
+# Function to run the mixed-effects model and return the summary
+run_model_flow <- function(data, flow_col) {
+  flow_col_quoted <- paste0("`", flow_col, "`")
+  formula <- as.formula(paste("HUT78_Specific_Killing ~", flow_col_quoted, "+ Timepoint + HIV + gender + (1 | PID)"))
+  model <- lmer(formula, data = data)
+  tidy(model)
+}
+
+run_model_flow <- function(data, flow_col) {
+  flow_col_quoted <- paste0("`", flow_col, "`")
+  formula <- as.formula(paste("HUT78_Specific_Killing ~", flow_col_quoted, "+ Timepoint + HIV + gender + (1 | PID)"))
+  model <- lmer(formula, data = data)
+  tidy(model)
+}
+
+run_model_CD107a <- function(data, flow_col) {
+  flow_col_quoted <- paste0("`", flow_col, "`")
+  formula <- as.formula(paste("CD56dimCD16+/CD107a ~", flow_col_quoted, "+ Timepoint + HIV + gender + (1 | PID)"))
+  model <- lmer(formula, data = data)
+  tidy(model)
+}
+# Collect results for each flow population
+results <- list()
+for (flow_col in flow_population_columns) {
+  model_summary <- run_model(TARA_Killing_HUT, flow_col)
+  results[[flow_col]] <- model_summary
+}
+
+# Combine results into a single dataframe
+results_df <- do.call(rbind, lapply(names(results), function(flow_col) {
+  df <- results[[flow_col]]
+  df$FlowPop <- flow_col
+  return(df)
+}))
+
+# Filter results for fixed effects (excluding intercept) and significant effects (p < 0.05)
+results_df <- results_df %>%
+  filter(term != "(Intercept)" & p.value < 0.05)
+
+# Select top 10 positive and top 10 negative effects
+top_positive_results <- results_df %>%
+  arrange(desc(estimate)) %>%
+  slice(1:20)
+
+top_negative_results <- results_df %>%
+  arrange(estimate) %>%
+  slice(1:20)
+
+top_results_df <- bind_rows(top_positive_results, top_negative_results)
+
+# Add significance stars and color coding
+top_results_df <- top_results_df %>%
+  mutate(significance = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01 ~ "**",
+    p.value < 0.05 ~ "*",
+    TRUE ~ ""
+  ),
+  Color = ifelse(estimate > 0, "lightblue", "lightgreen"))
+
+# Plot the results with significance stars and error bars
+ggplot(top_results_df, aes(x = reorder(FlowPop, estimate), y = estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error), width = 0.4) +
+  geom_text(aes(label = significance), vjust = -0.5, colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Top 10  Significant Effects of Flow Populations on HUT78 Specific Killing",
+       x = "Flow Cytometry Gated Populations",
+       y = "Effect Size") +
+  theme_minimal() +
+  guides(fill=FALSE) # Hide the legend for fill
+
+  
+  # Mixed effect model using CD56dimCD16+/CD107a as outcome variable
+
+# Mixed effect model using CD56dimCD16+/IFNy as outcome variable
+
+# Mixed effect model using CD56dimCD16+/MIP-1B as outcome variable
+
+# Covariate Analysis for HEI vs HEU, for viral load and for timepoint
+
+
 
 for (treatment in treatments) {
   # Create a subset for the current treatment
