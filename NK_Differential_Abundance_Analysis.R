@@ -12,6 +12,8 @@ library(ggplot2)
 library(ggrepel)
 library(plotly)
 library(broom.mixed)
+library(extrafont)
+loadfonts(device = "win")
 ########### Read in Data and Viral Data ############
 setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV")
 data <- read_excel("NK Function MetaDATA_REVISED0724v2.xlsx", col_names = TRUE)
@@ -152,6 +154,9 @@ pave_kl_Freq <- split_Freq[["PAVE KL"]]
 
 # Access the dataframe for "TARA"
 tara_Freq <- split_Freq[["TARA"]]
+# Set all values in columns  that are less than 1% to 0
+tara_Freq[, 15:ncol(tara_Freq)][tara_Freq[, 15:ncol(tara_Freq)] < 1] <- 0
+
 
 
 #### Impute NA Values #########
@@ -262,7 +267,16 @@ total_nk_col <- tara_Freq$`Total NK`
 # Step 2: Convert values after column 19 to percentages of `Total NK`
 tara_Freq[, 20:ncol(tara_Freq)] <- round(tara_Freq[, 20:ncol(tara_Freq)] / total_nk_col * 100,2)
 
+######
+# Assuming your dataframe is named df and the column range is from column A to column B
+cols_to_check <- 15:ncol(tara_Freq)
 
+# Calculate the proportion of 0s in the specified columns
+cols_to_keep <- colMeans(tara_Freq[, cols_to_check] == 0) <= 0.8
+
+# Keep only the columns within the specified range that have 80% or fewer 0s
+tara_Freq <- tara_Freq[, c(names(tara_Freq)[-cols_to_check], names(tara_Freq)[cols_to_check][cols_to_keep])]
+########
 ###### NK KILLING Analysis #############
 
 ### Cleaning Dataframe ###
@@ -271,9 +285,191 @@ tara_Freq[, 20:ncol(tara_Freq)] <- round(tara_Freq[, 20:ncol(tara_Freq)] / total
 tara_Freq$Treatment <- droplevels(tara_Freq$Treatment)
 levels(tara_Freq$Treatment)
 
+### Mixed Model Functions ####
+filter_top_effects <- function(data_frame, significance_threshold = 0.05) {
+  # Step 1: Filter significant effects
+  significant_effects <- data_frame %>%
+    filter(P.Value <= significance_threshold)
+  
+  # Step 2: Calculate how many more effects are needed to reach 10
+  remaining_needed <- 10 - nrow(significant_effects)
+  
+  # Step 3: If fewer than 10 significant effects, pick the remaining non-significant effects
+  if (remaining_needed > 0) {
+    # Filter non-significant effects
+    non_significant_effects <- data_frame %>%
+      filter(P.Value > significance_threshold)
+    
+    # Split non-significant effects into positive and negative
+    positive_non_significant <- non_significant_effects %>%
+      filter(Estimate > 0) %>%
+      arrange(desc(Estimate)) # Sort positive by descending Estimate
+    
+    negative_non_significant <- non_significant_effects %>%
+      filter(Estimate < 0) %>%
+      arrange(Estimate) # Sort negative by ascending Estimate
+    
+    # Determine how many positive and negative we can pick
+    max_to_pick <- ceiling(remaining_needed / 2)
+    pos_to_pick <- min(nrow(positive_non_significant), max_to_pick)
+    neg_to_pick <- min(nrow(negative_non_significant), remaining_needed - pos_to_pick)
+    
+    # If we couldn't get enough negatives, pick more positives
+    if (pos_to_pick + neg_to_pick < remaining_needed) {
+      pos_to_pick <- remaining_needed - neg_to_pick
+    }
+    
+    # Select the rows
+    selected_positives <- positive_non_significant %>% head(pos_to_pick)
+    selected_negatives <- negative_non_significant %>% head(neg_to_pick)
+    
+    # Combine significant effects with the selected non-significant effects
+    top_effects <- bind_rows(significant_effects, selected_positives, selected_negatives)
+  } else {
+    # If there are already 10 or more significant effects, just return the top 10
+    top_effects <- significant_effects %>%
+      arrange(desc(abs(Estimate))) %>%
+      head(10)
+  }
+  
+  return(top_effects)
+}
+filter_top_effects_fas <- function(data_frame, significance_threshold = 0.05) {
+  # Filter significant effects
+  significant_effects <- data_frame %>%
+    filter(P.Value <= significance_threshold)
+  
+  # Ensure CD56dimCD16+/FasL is included if it's not in significant effects
+  if (!"CD56dimCD16+/FasL" %in% significant_effects$Subset) {
+    fasl_row <- data_frame %>%
+      filter(Subset == "CD56dimCD16+/FasL")
+    significant_effects <- bind_rows(significant_effects, fasl_row)
+  }
+  
+  # Calculate how many more effects are needed
+  remaining_needed <- 10 - nrow(significant_effects)
+  
+  # Pick remaining non-significant effects to fill up to 10
+  if (remaining_needed > 0) {
+    non_significant_effects <- data_frame %>%
+      filter(P.Value > significance_threshold) %>%
+      filter(Subset != "CD56dimCD16+/FasL") %>%
+      arrange(desc(abs(Estimate))) %>%
+      head(remaining_needed)
+    
+    top_effects <- bind_rows(significant_effects, non_significant_effects)
+  } else {
+    top_effects <- significant_effects %>%
+      arrange(desc(abs(Estimate))) %>%
+      head(10)
+  }
+  
+  return(top_effects)
+}
+fit_lmer_models <- function(data, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05) {
+  models_list <- list()
+  
+  # Loop through each subset, ensuring column names are correctly handled
+  for (subset_name in flow_population_columns) {
+    # Escape subset_name if it contains special characters
+    escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
+    
+    # Construct the formula string with escaped column names
+    formula_str <- paste(fixed_part_of_formula, "+", escaped_subset_name)
+    
+    # Convert the string to a formula
+    current_formula <- as.formula(formula_str)
+    
+    # Fit the model using the current formula
+    model <- tryCatch({
+      lmer(current_formula, data = data)
+    }, error = function(e) {
+      cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
+      return(NULL)  # Return NULL if there was an error fitting the model
+    })
+    
+    # Store the model if successfully fitted
+    if (!is.null(model)) {
+      models_list[[subset_name]] <- model
+    }
+  }
+  
+  # Initialize an empty data frame to store the results
+  results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
+                           Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
+  
+  # Loop through each model to extract information
+  for (subset_name in names(models_list)) {
+    model <- models_list[[subset_name]]
+    summary_model <- summary(model)
+    df <- as.data.frame(summary_model$coefficients)
+    df$Subset <- subset_name
+    df$Effect <- rownames(df)
+    results_df <- rbind(results_df, df)
+  }
+  
+  # Rename columns to make them consistent
+  results_df <- results_df %>%
+    rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
+    select(Subset, Effect, Estimate, `Std.Error`, P.Value)
+  
+  # Escape subset names to match Effect names in the results
+  escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
+  
+  # Filter results to include only significant effects
+  filtered_results_df <- results_df %>%
+    filter(Effect %in% escaped_subset_names)
+  
+  # Filter for significant effects
+  significant_results <- filtered_results_df %>%
+    #filter(P.Value < p_value_threshold) %>%
+    filter(Std.Error < 1) %>%
+    mutate(Significance = ifelse(P.Value < 0.05, "*", ""),
+           Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+  
+  return(significant_results)
+}
+
+tara_Freq$`Specific Killing` <- as.numeric(tara_Freq$`Specific Killing`)
+tara_Freq_plot <- tara_Freq %>% drop_na(14)
+tara_Freq_plot_filtered <- tara_Freq_plot %>%
+  filter(!Treatment %in% "untreated", HIV != "HUU")
+tara_Freq_plot_filtered <- tara_Freq_plot_filtered %>%
+  mutate(HIV = recode(HIV, "positive" = "HEI", "negative" = "HEU"))
+# Ensure Timepoint is a factor and reorder it so "Entry" comes before "12"
+tara_Freq_plot_filtered <- tara_Freq_plot_filtered %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("Entry", "12")))
+
+
+######## Paired Plots #####
+# Plot the updated data
+library(ggpubr)
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV")
+
+ggplot(tara_Freq_plot_filtered, aes(x = Timepoint, y = `Specific Killing`, group = PID, color = HIV)) +
+  geom_line(aes(linetype = HIV), size = 1) +  # Set line size
+  geom_point(size = 2) +  # Set point size
+  facet_grid(HIV ~ Treatment, scales = "free_y") +  # Splitting by both HIV and Treatment
+  theme_minimal(base_size = 15) +  # Increase base font size for readability
+  labs(
+    title = "Specific Killing Across Treatments, Timepoints, and HIV Status",
+    y = "Specific Killing (%)", 
+    x = "Timepoint"
+  ) +
+  scale_color_manual(values = c("HEI" = "red", "HEU" = "blue")) +  # Custom colors for HEI and HEU
+  scale_linetype_manual(values = c("HEI" = "solid", "HEU" = "dashed")) +  # Custom linetypes for HEI and HEU
+  theme(
+    plot.title = element_text(hjust = 0.5),  # Center the title
+    strip.text = element_text(size = 14),  # Adjust facet label size
+    legend.title = element_blank(),  # Remove legend title
+    legend.position = "top"  # Move the legend to the top
+  )
+ggsave("Specific_Killing_Paired_Plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+##### HUT Mechanism ########
+
+#### Clean and create the HUT dataframe ####
 #### Seperate HUT Data
-
-
 
 # Separate the HUT data
 TARA_HUT78_Freq <- tara_Freq %>%
@@ -306,81 +502,14 @@ TARA_HUT78_Freq$`viral load` <- scale(TARA_HUT78_Freq$`viral load`)
 # List of columns representing flow populations, starting from column 13 onwards
 flow_population_columns <- colnames(TARA_HUT78_Freq)[15:ncol(TARA_HUT78_Freq)] 
 
-
-filter_top_effects <- function(data_frame) {
-  positive_effects <- data_frame %>% 
-    arrange(desc(Estimate)) %>% 
-    head(35)
-  
-  negative_effects <- data_frame %>% 
-    arrange(Estimate) %>% 
-    head(35)
-  
-  bind_rows(positive_effects, negative_effects)
-}
 ##### FLOW HUT #######
-setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/Mixed_Model_Plots")
+
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/Mixed_Model_Plots/HUT_Mechanism")
 # Initialize lists to store results
-x <- lmer(" `Specific Killing` ~ `viral load` + Timepoint  + gender + HIV  + (1 | PID)", data = TARA_HUT78_Freq)
-summary(x)
-models_list <- list()
+
 fixed_part_of_formula <- "`Specific Killing` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
-# Loop through each  subset, ensuring column names are correctly handled
-for (subset_name in flow_population_columns) {
-  # Escape subset_name if it contains special characters
-  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
-  
-  # Construct the formula string with escaped column names
-  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
-  
-  # Convert the string to a formula
-  current_formula <- as.formula(formula_str)
-  
-  
-  # Fit the model using the current formula
-  model <- tryCatch({
-    lmer(current_formula, data = TARA_HUT78_Freq)
-  }, error = function(e) {
-    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
-    return(NULL)  # Return NULL if there was an error fitting the model
-  })
-  
-  # Store the model if successfully fitted
-  if (!is.null(model)) {
-    models_list[[subset_name]] <- model
-  }
-}
-
-# Initialize an empty data frame to store the results
-results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
-                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
-
-# Loop through each model to extract information
-for (subset_name in names(models_list)) {
-  model <- models_list[[subset_name]]
-  summary_model <- summary(model)
-  df <- as.data.frame(summary_model$coefficients)
-  df$Subset <- subset_name
-  df$Effect <- rownames(df)
-  results_df <- rbind(results_df, df)
-}
-df
-results_df <- results_df %>% 
-  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
-  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
-
-escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
-filtered_results_df <- results_df %>% 
-  filter(Effect %in% escaped_subset_names)
-
-
-
-# Filter the results to include only significant effects
-HUT78 <- filtered_results_df %>%
-  filter(P.Value < 0.05) %>%
-  mutate(Significance = "*",
-         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
-
+HUT78 <- fit_lmer_models(TARA_HUT78_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05) 
+filter_top_effects(HUT78)
 # Create the plot with only significant effects
 ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
   geom_col() +
@@ -388,70 +517,59 @@ ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimat
   geom_text(aes(label = Significance), colour = "red") +
   scale_fill_identity() +
   coord_flip() +
-  labs(title = "Effect of Flow Subsets onHUT78 Specific Killing (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  labs(title = "Effect of Flow Subsets on HUT78 Specific Killing (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
   theme_minimal() +
   guides(fill = FALSE)  # Hide the legend for fill
-
+filter_top_effects(HUT78)
 ggsave("Flow_Effects_on_Specific_Killing_HUT78_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+library(ggridges)
+
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, size = abs(Estimate), color = Estimate)) +
+  geom_point(alpha = 0.7) +
+  scale_size(range = c(3, 10)) +
+  scale_color_gradient(low = "cyan", high = "magenta") +
+  geom_text(aes(label = Significance), colour = "darkred", hjust = .5, vjust = .75, size = 4) +  # Center significance star
+  coord_flip() +
+  labs(title = "Bubble Plot of HIV Effect on Specific Killing", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  theme(
+    text = element_text(family = "Calibri"),  # Change font to Calibri
+    axis.text.y = element_text(size = 12),  # Make row names larger and thicker
+    axis.title.y = element_text(size = 14),  # Larger y-axis title
+    axis.title.x = element_text(size = 14),  # Larger x-axis title
+    plot.title = element_text(size = 16, face = "bold"),  # Larger and bold title
+    legend.position = "right"  # Keep the color legend
+  ) +
+  guides(size = "none")  # Remove the legend for size
+
+HUT78_filtered <- HUT78 %>%
+  filter(nchar(Subset) <= 30)
+HUT78_filtered <- HUT78_filtered %>%
+  filter(Subset != "CD107a-Granzyme B-Perforin+")
+HUT78_filtered <- HUT78_filtered %>%
+  filter(P.Value <0.05)
+
+ggplot(HUT78_filtered, aes(x = reorder(Subset, Estimate), y = Estimate, color = Estimate)) +
+  geom_segment(aes(x = reorder(Subset, Estimate), xend = reorder(Subset, Estimate), y = 0, yend = Estimate), size = 1) +
+  geom_point(size = 4) +
+  scale_color_gradient(low = "blue", high = "red") +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on HUT78 Specific Killing", 
+       x = "Subsets", 
+       y = "Effect Size") +
+  ylim(-1.5, 2) +  # Set the y-axis limits from -1.5 to 1.5
+  theme_minimal() +
+  theme(legend.position = "right",
+        text = element_text(family = "Calibri"), # Set font to Calibri
+        axis.text.x = element_text(size = 8, family = "Calibri"), 
+        axis.text.y = element_text(size = 9, family = "Calibri"), 
+        plot.title = element_text(hjust = 0.5, size = 15, family = "Calibri")) # Center th
+
+ggsave("Flow_Effects_on_Specific_Killing_HUT78_TARA_Freq_significant_only_plot_lolipop.png", width = 7, height = 4, dpi = 300,bg='white')
 
 ##### IFNg HUT #######
-models_list <- list()
 fixed_part_of_formula <- "`CD56dimCD16+/IFNy` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
-# Loop through each  subset, ensuring column names are correctly handled
-for (subset_name in flow_population_columns) {
-  # Escape subset_name if it contains special characters
-  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
-  
-  # Construct the formula string with escaped column names
-  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
-  
-  # Convert the string to a formula
-  current_formula <- as.formula(formula_str)
-  
-  
-  # Fit the model using the current formula
-  model <- tryCatch({
-    lmer(current_formula, data = TARA_HUT78_Freq)
-  }, error = function(e) {
-    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
-    return(NULL)  # Return NULL if there was an error fitting the model
-  })
-  
-  # Store the model if successfully fitted
-  if (!is.null(model)) {
-    models_list[[subset_name]] <- model
-  }
-}
-
-# Initialize an empty data frame to store the results
-results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
-                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
-
-# Loop through each model to extract information
-for (subset_name in names(models_list)) {
-  model <- models_list[[subset_name]]
-  summary_model <- summary(model)
-  df <- as.data.frame(summary_model$coefficients)
-  df$Subset <- subset_name
-  df$Effect <- rownames(df)
-  results_df <- rbind(results_df, df)
-}
-df
-results_df <- results_df %>% 
-  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
-  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
-
-escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
-filtered_results_df <- results_df %>% 
-  filter(Effect %in% escaped_subset_names)
-
-
-
-# Filter the results to include only significant effects
-HUT78 <- filtered_results_df %>%
-  filter(P.Value < 0.05) %>%
-  mutate(Significance = "*",
-         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+HUT78 <- fit_lmer_models(TARA_HUT78_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05) 
 
 # Create the plot with only significant effects
 ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
@@ -469,63 +587,8 @@ ggsave("Flow_Effects_on_IFNy_TARA_Freq_significant_plot.png", width = 10, height
 ##### CD56dimCD16+/MIP-1B HUT #######
 # Initialize lists to store results
 
-models_list <- list()
 fixed_part_of_formula <- "`CD56dimCD16+/MIP-1B` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
-# Loop through each  subset, ensuring column names are correctly handled
-for (subset_name in flow_population_columns) {
-  # Escape subset_name if it contains special characters
-  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
-  
-  # Construct the formula string with escaped column names
-  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
-  
-  # Convert the string to a formula
-  current_formula <- as.formula(formula_str)
-  
-  
-  # Fit the model using the current formula
-  model <- tryCatch({
-    lmer(current_formula, data = TARA_HUT78_Freq)
-  }, error = function(e) {
-    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
-    return(NULL)  # Return NULL if there was an error fitting the model
-  })
-  
-  # Store the model if successfully fitted
-  if (!is.null(model)) {
-    models_list[[subset_name]] <- model
-  }
-}
-
-# Initialize an empty data frame to store the results
-results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
-                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
-
-# Loop through each model to extract information
-for (subset_name in names(models_list)) {
-  model <- models_list[[subset_name]]
-  summary_model <- summary(model)
-  df <- as.data.frame(summary_model$coefficients)
-  df$Subset <- subset_name
-  df$Effect <- rownames(df)
-  results_df <- rbind(results_df, df)
-}
-df
-results_df <- results_df %>% 
-  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
-  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
-
-escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
-filtered_results_df <- results_df %>% 
-  filter(Effect %in% escaped_subset_names)
-
-
-
-# Filter the results to include only significant effects
-HUT78 <- filtered_results_df %>%
-  filter(P.Value < 0.05) %>%
-  mutate(Significance = "*",
-         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+HUT78 <- fit_lmer_models(TARA_HUT78_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05) 
 
 # Create the plot with only significant effects
 ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
@@ -543,64 +606,9 @@ ggsave("Flow_Effects_on_MIP-1B_TARA_Freq_significant_plot.png", width = 10, heig
 
 
 ##### CD56dimCD16+/CD107A HUT #######
-# Initialize lists to store results
-models_list <- list()
+
 fixed_part_of_formula <- "`CD56dimCD16+/CD107a` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
-# Loop through each  subset, ensuring column names are correctly handled
-for (subset_name in flow_population_columns) {
-  # Escape subset_name if it contains special characters
-  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
-  
-  # Construct the formula string with escaped column names
-  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
-  
-  # Convert the string to a formula
-  current_formula <- as.formula(formula_str)
-  
-  
-  # Fit the model using the current formula
-  model <- tryCatch({
-    lmer(current_formula, data = TARA_HUT78_Freq)
-  }, error = function(e) {
-    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
-    return(NULL)  # Return NULL if there was an error fitting the model
-  })
-  
-  # Store the model if successfully fitted
-  if (!is.null(model)) {
-    models_list[[subset_name]] <- model
-  }
-}
-
-# Initialize an empty data frame to store the results
-results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
-                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
-
-# Loop through each model to extract information
-for (subset_name in names(models_list)) {
-  model <- models_list[[subset_name]]
-  summary_model <- summary(model)
-  df <- as.data.frame(summary_model$coefficients)
-  df$Subset <- subset_name
-  df$Effect <- rownames(df)
-  results_df <- rbind(results_df, df)
-}
-df
-results_df <- results_df %>% 
-  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
-  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
-
-escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
-filtered_results_df <- results_df %>% 
-  filter(Effect %in% escaped_subset_names)
-
-
-
-# Filter the results to include only significant effects
-HUT78 <- filtered_results_df %>%
-  filter(P.Value < 0.05) %>%
-  mutate(Significance = "*",
-         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+HUT78 <- fit_lmer_models(TARA_HUT78_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05)
 
 # Create the plot with only significant effects
 ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
@@ -616,68 +624,97 @@ ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimat
 ggsave("Flow_Effects_on_CD107a_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
 
 
-### Effect of HIV Status #######
-
-models_list <- list()
-fixed_part_of_formula <- "HIV ~ `viral load` + Timepoint  + gender + (1 | PID)"
-# Loop through each  subset, ensuring column names are correctly handled
-for (subset_name in flow_population_columns) {
-  # Escape subset_name if it contains special characters
-  escaped_subset_name <- paste0("`", gsub("/", "\\/", subset_name), "`")
-  
-  # Construct the formula string with escaped column names
-  formula_str <- paste(fixed_part_of_formula,"+",escaped_subset_name)
-  
-  # Convert the string to a formula
-  current_formula <- as.formula(formula_str)
-  
-  
-  # Fit the model using the current formula
-  model <- tryCatch({
-    lmer(current_formula, data = TARA_HUT78_Freq)
-  }, error = function(e) {
-    cat("Error in fitting model for subset:", subset_name, "\nError message:", e$message, "\n")
-    return(NULL)  # Return NULL if there was an error fitting the model
-  })
-  
-  # Store the model if successfully fitted
-  if (!is.null(model)) {
-    models_list[[subset_name]] <- model
-  }
-}
-
-# Initialize an empty data frame to store the results
-results_df <- data.frame(Subset = character(), Effect = character(), Estimate = numeric(), 
-                         Std.Error = numeric(), P.Value = numeric(), stringsAsFactors = FALSE)
-
-# Loop through each model to extract information
-for (subset_name in names(models_list)) {
-  model <- models_list[[subset_name]]
-  summary_model <- summary(model)
-  df <- as.data.frame(summary_model$coefficients)
-  df$Subset <- subset_name
-  df$Effect <- rownames(df)
-  results_df <- rbind(results_df, df)
-}
-df
-results_df <- results_df %>% 
-  rename(Estimate = Estimate, Std.Error = `Std. Error`, P.Value = `Pr(>|t|)`) %>%
-  select(Subset, Effect, Estimate, `Std.Error`, P.Value)
-
-escaped_subset_names <- paste0("`", gsub("/", "\\/", flow_population_columns), "`")
-filtered_results_df <- results_df %>% 
-  filter(Effect %in% escaped_subset_names)
+#### K562 Mechanism ####
 
 
+#### Clean and create the HUT dataframe ####
+#### Seperate K562  Data
 
-# Filter the results to include only significant effects
-HUT78 <- filtered_results_df %>%
-  filter(P.Value < 0.05) %>%
-  mutate(Significance = "*",
-         Color = ifelse(Estimate > 0, "lightblue", "lightgreen"))
+# Separate the K562 data
+TARA_K562_Freq <- tara_Freq %>%
+  filter(Treatment == "K562")
+
+# Filter unneeded columna
+TARA_K562_Freq$Group <- NULL
+TARA_K562_Freq$`age group` <- NULL
+TARA_K562_Freq$`age (yrs)` <- NULL
+TARA_K562_Freq$Target <- NULL
+TARA_K562_Freq$`Target/Dead`<- NULL
+TARA_K562_Freq$Timepoint <- as.factor(TARA_K562_Freq$Timepoint)
+TARA_K562_Freq$Timepoint <- factor(TARA_K562_Freq$Timepoint, levels = rev(levels(TARA_K562_Freq$Timepoint)))
+
+TARA_K562_Freq <- TARA_K562_Freq %>%
+  filter(HIV != "HUU")
+
+# Clean
+
+TARA_K562_Freq <- TARA_K562_Freq[!is.na(TARA_K562_Freq$`Specific Killing`), ]
+TARA_K562_Freq <- droplevels(TARA_K562_Freq)
+TARA_K562_Freq$`Specific Killing`<- as.numeric(TARA_K562_Freq$`Specific Killing`)
+TARA_K562_Freq$`Specific Killing`<- round(TARA_K562_Freq$`Specific Killing`, 2)
+
+
+# Standardize the 'viral load' variable because of high values
+
+TARA_K562_Freq$`viral load` <- scale(TARA_K562_Freq$`viral load`)
+
+# List of columns representing flow populations, starting from column 13 onwards
+flow_population_columns <- colnames(TARA_K562_Freq)[15:ncol(TARA_K562_Freq)] 
+
+##### FLOW K562 #######
+
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/Mixed_Model_Plots/K562_Mechanism")
+# Initialize lists to store results
+
+fixed_part_of_formula <- "`Specific Killing` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+K562 <- fit_lmer_models(TARA_K562_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05) 
 
 # Create the plot with only significant effects
-ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+ggplot(filter_top_effects(K562), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on K562 Specific Killing (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+#K562_filtered <- K562 %>%
+#  filter(nchar(Subset) <= 30)
+K562_filtered <- K562 %>%
+  filter(Subset != "CD56dimCD16+/CD107a total" & Subset != "CD107a-"
+         & Subset != "CD107a total"& Subset != "CD107a+Granzyme B+Perforin+"
+         & Subset != "CD107a-Granzyme B+Perforin+")
+
+
+K562_filtered <- K562_filtered %>%
+  filter(P.Value <0.05)
+
+ggplot(K562_filtered, aes(x = reorder(Subset, Estimate), y = Estimate, color = Estimate)) +
+  geom_segment(aes(x = reorder(Subset, Estimate), xend = reorder(Subset, Estimate), y = 0, yend = Estimate), size = 1) +
+  geom_point(size = 4) +
+  scale_color_gradient(low = "blue", high = "red") +
+  coord_flip() +
+  ylim(-1.5, 2) +  # Set the y-axis limits from -1.5 to 1.5
+  labs(title = "Effect of Flow Subsets on K562 Specific Killing", 
+       x = "Subsets", 
+       y = "Effect Size") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        text = element_text(family = "Calibri"), # Set font to Calibri
+        axis.text.x = element_text(size = 8, family = "Calibri"), 
+        axis.text.y = element_text(size = 9, family = "Calibri"), 
+        plot.title = element_text(hjust = 1, size = 15, family = "Calibri")) # Center th
+ggsave("Flow_Effects_on_Specific_Killing_K562_TARA_Freq_significant_plot_lolipop.png", width = 7, height = 4, dpi = 300,bg='white')
+
+
+##### IFNg K562 #######
+fixed_part_of_formula <- "`CD56dimCD16+/IFNy` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+K562 <- fit_lmer_models(TARA_K562_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05) 
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(K562), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
   geom_col() +
   geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
   geom_text(aes(label = Significance), colour = "red") +
@@ -689,113 +726,53 @@ ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimat
 
 ggsave("Flow_Effects_on_IFNy_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
 
+##### CD56dimCD16+/MIP-1B K562 #######
+# Initialize lists to store results
 
+fixed_part_of_formula <- "`CD56dimCD16+/MIP-1B` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+K562 <- fit_lmer_models(TARA_K562_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05) 
 
-
-
-
-
-
-
-
-
-###########
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-######
-# Collect results for each flow population
-TARA_results_HUT_flow <- list()
-for (flow_col in flow_population_columns) {
-  model_summary <- run_model_flow(TARA_HUT78_Freq, flow_col)
-  TARA_results_HUT_flow[[flow_col]] <- model_summary
-}
-
-# Combine results into a single dataframe
-TARA_flow_HUT_df <- do.call(rbind, lapply(names(TARA_results_HUT_flow), function(flow_col) {
-  df <- TARA_results_HUT_flow[[flow_col]]
-  df$FlowPop <- flow_col
-  return(df)
-}))
-
-# Filter results for fixed effects (excluding intercept) and significant effects (p < 0.05)
-TARA_flow_HUT_plot <- TARA_flow_HUT_df %>%
-  filter(term != "(Intercept)" & p.value < 0.05)
-
-# Select top 10 positive and top 10 negative effects
-top_positive_results <- TARA_flow_HUT_plot %>%
-  arrange(desc(estimate)) %>%
-  slice(1:10)
-
-top_negative_results <- TARA_flow_HUT_plot %>%
-  arrange(estimate) %>%
-  slice(1:10)
-
-top_results_df <- bind_rows(top_positive_results, top_negative_results)
-
-# Add significance stars and color coding
-top_results_df <- top_results_df %>%
-  mutate(significance = case_when(
-    p.value < 0.001 ~ "***",
-    p.value < 0.01 ~ "**",
-    p.value < 0.05 ~ "*",
-    TRUE ~ ""
-  ),
-  Color = ifelse(estimate > 0, "lightblue", "lightgreen"))
-
-# Plot the results with significance stars and error bars
-ggplot(top_results_df, aes(x = reorder(FlowPop, estimate), y = estimate, fill = Color)) +
+# Create the plot with only significant effects
+ggplot(filter_top_effects(K562), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
   geom_col() +
-  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error), width = 0.4) +
-  geom_text(aes(label = significance), vjust = -0.5, colour = "red") +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
   scale_fill_identity() +
   coord_flip() +
-  labs(title = "Top 10  Significant Effects of Flow Populations on HUT78 Specific Killing",
-       x = "Flow Cytometry Gated Populations",
-       y = "Effect Size") +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/MIP-1B` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
   theme_minimal() +
-  guides(fill=FALSE) # Hide the legend for fill
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Flow_Effects_on_MIP-1B_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+
+
+##### CD56dimCD16+/CD107A K562 #######
+
+fixed_part_of_formula <- "`CD56dimCD16+/CD107a` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+K562 <- fit_lmer_models(TARA_K562_Freq, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05)
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(K562), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/CD107a` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Flow_Effects_on_CD107a_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
 
 
 
 
 
 
+### Combine untreated with Specific Killing ###
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#################################################################################################
-###
 # Separate the untreated data
 untreated_data <- tara_Freq %>%
   filter(Treatment == "untreated")
@@ -835,14 +812,353 @@ TARA_Killing$`Specific Killing`<-NULL
 TARA_Killing <- TARA_Killing %>%
   filter(HIV != "HUU")
 
-# Round the values in the 'specific killing' column to two decimal points
-TARA_Killing$`Specific Killing` <- as.numeric(TARA_Killing$`Specific Killing`)
-TARA_Killing$`Specific Killing` <- round(TARA_Killing$`Specific Killing`, 2)
 
-### Fix missing VL Value
+
 # Update the Viral_Load column for PID CP018 at Timepoint entry
 TARA_Killing <- TARA_Killing %>%
   mutate(`viral load` = ifelse(PID == "CP018" & Timepoint == "Entry", 176970, `viral load`))
+
+
+
+# Standardize the 'viral load' variable because of high values
+
+TARA_Killing$`viral load` <- scale(TARA_Killing$`viral load`)
+
+###### HUT Prediction (Untreated - HUT) ############
+# Round the values in the 'specific killing' column to two decimal points
+TARA_Killing$HUT78_Specific_Killing <- as.numeric(TARA_Killing$HUT78_Specific_Killing)
+TARA_Killing$HUT78_Specific_Killing <- round(TARA_Killing$HUT78_Specific_Killing, 2)
+TARA_Killing$K562_Specific_Killing <- as.numeric(TARA_Killing$K562_Specific_Killing)
+TARA_Killing$K562_Specific_Killing <- round(TARA_Killing$K562_Specific_Killing, 2)
+
+# List of columns representing flow populations, starting from column 13 onwards
+flow_population_columns <- colnames(TARA_Killing)[14:(ncol(TARA_Killing)-7)] 
+
+TARA_Killing <- TARA_Killing[!is.na(TARA_Killing$HUT78_Specific_Killing), ]
+
+##### FLOW HUT #######
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/Mixed_Model_Plots/Untreated_HUT_Prediction")
+
+# Initialize lists to store results
+
+fixed_part_of_formula <- "HUT78_Specific_Killing ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+HUT78 <- fit_lmer_models(TARA_Killing, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05)
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on HUT78 Specific Killing (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal()
+
+ggsave("Untreated_Flow_Effects_on_Specific_Killing_HUT78_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+
+HUT78_filtered <- HUT78 %>%
+  filter(P.Value <0.05)
+
+ggplot(HUT78_filtered, aes(x = reorder(Subset, Estimate), y = Estimate, color = Estimate)) +
+  geom_segment(aes(x = reorder(Subset, Estimate), xend = reorder(Subset, Estimate), y = 0, yend = Estimate), size = 1) +
+  geom_point(size = 4) +
+  scale_color_gradient(low = "blue", high = "red") +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on HUT78 Specific Killing", 
+       x = "Subsets", 
+       y = "Effect Size") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        text = element_text(family = "Calibri"), # Set font to Calibri
+        axis.text.x = element_text(size = 8, family = "Calibri"), 
+        axis.text.y = element_text(size = 9, family = "Calibri"), 
+        plot.title = element_text(hjust = 0.5, size = 15, family = "Calibri")) # Center th
+ggsave("Untreated_Flow_Effects_on_Specific_Killing_HUT78_TARA_Freq_significant_only_plot_lolipop.png", width = 7, height = 4, dpi = 300,bg='white')
+
+
+##### IFNg HUT #######
+fixed_part_of_formula <- "`CD56dimCD16+/IFNy` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+HUT78 <- fit_lmer_models(TARA_Killing, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05)
+
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/IFNy` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Untreated_Flow_Effects_on_IFNy_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+##### CD56dimCD16+/MIP-1B HUT #######
+# Initialize lists to store results
+
+fixed_part_of_formula <- "`CD56dimCD16+/MIP-1B` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+HUT78 <- fit_lmer_models(TARA_Killing, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05)
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/MIP-1B` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Untreated_Flow_Effects_on_MIP-1B_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+
+
+##### CD56dimCD16+/CD107A HUT #######
+# Initialize lists to store results
+fixed_part_of_formula <- "`CD56dimCD16+/CD107a` ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+HUT78 <- fit_lmer_models(TARA_Killing, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05)
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(HUT78), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on `CD56dimCD16+/CD107a` (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal() +
+  guides(fill = FALSE)  # Hide the legend for fill
+
+ggsave("Untereated_Flow_Effects_on_CD107a_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+###### Untreated vs K562 ############
+
+
+##### FLOW HUT #######
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/Mixed_Model_Plots/Untreated_HUT_Prediction")
+
+# Initialize lists to store results
+
+fixed_part_of_formula <- "K562_Specific_Killing ~ `viral load` + Timepoint  + gender + HIV + (1 | PID)"
+K562 <- fit_lmer_models(TARA_Killing, fixed_part_of_formula, flow_population_columns, p_value_threshold = 0.05)
+
+# Create the plot with only significant effects
+ggplot(filter_top_effects(K562), aes(x = reorder(Subset, Estimate), y = Estimate, fill = Color)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = Estimate - `Std.Error`, ymax = Estimate + `Std.Error`), width = 0.4) +
+  geom_text(aes(label = Significance), colour = "red") +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on K562 Specific Killing (Significant Effects Only)", x = "Subsets", y = "Effect Size") +
+  theme_minimal()
+
+ggsave("Untreated_Flow_Effects_on_Specific_Killing_K562_TARA_Freq_significant_plot.png", width = 10, height = 8, dpi = 300,bg='white')
+
+K562_filtered <- K562 %>%
+  filter(Subset != 'NKG2A-')
+
+
+K562_filtered <- K562_filtered %>%
+  filter(P.Value <0.05)
+
+ggplot(K562_filtered, aes(x = reorder(Subset, Estimate), y = Estimate, color = Estimate)) +
+  geom_segment(aes(x = reorder(Subset, Estimate), xend = reorder(Subset, Estimate), y = 0, yend = Estimate), size = 1) +
+  geom_point(size = 4) +
+  scale_color_gradient(low = "blue", high = "red") +
+  coord_flip() +
+  labs(title = "Effect of Flow Subsets on K562 Specific Killing", 
+       x = "Subsets", 
+       y = "Effect Size") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        text = element_text(family = "Calibri"), # Set font to Calibri
+        axis.text.x = element_text(size = 8, family = "Calibri"), 
+        axis.text.y = element_text(size = 9, family = "Calibri"), 
+        plot.title = element_text(hjust = 1, size = 15, family = "Calibri")) # Center th
+ggsave("Flow_Effects_on_Specific_Killing_K562_TARA_Freq_significant_plot_lolipop_Untreated.png", width = 7, height = 4, dpi = 300,bg='white')
+
+
+#################################################################################################
+### Differential Abundance analysis
+TARA_Freq_DA <- tara_Freq[, !(names(tara_Freq) %in% c("Batch", "Group","age group", "age (yrs)","Count", "P1", "P2", "P3", "P4", "Specific Killing","Target","Target/Dead"))]
+TARA_Freq_DA$Timepoint <- as.factor(TARA_Freq_DA$Timepoint)
+TARA_Freq_DA <- droplevels(TARA_Freq_DA)
+covariate_columns <- c("PID", "gender", "HIV", "viral load", "Timepoint", "Treatment")
+TARA_Freq_DA <- TARA_Freq_DA[TARA_Freq_DA$HIV != "HUU", ]
+#### Effect of IL-15 ###################
+setwd("C:/Users/ammas/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/IL15_Effect")
+
+# Initialize a list to store results
+results_list_paired <- list()
+# Update the Viral_Load column for PID CP018 at Timepoint entry
+TARA_Freq_DA <- TARA_Freq_DA %>%
+  mutate(`viral load` = ifelse(PID == "CP018" & Timepoint == "Entry", 176970, `viral load`))
+# Define pairs of treatments to compare
+treatment_pairs <- list(
+  "untreated" = "IL15",
+  "CEM" = "CEM+IL15",
+  "HUT78" = "HUT78+IL15",
+  "K562" = "K562+IL15"
+)
+# Process each treatment pair
+for (baseline in names(treatment_pairs)) {
+  treated <- treatment_pairs[[baseline]]
+  
+  # Filter data for only the current pair of treatments
+  pair_data <- TARA_Freq_DA[TARA_Freq_DA$Treatment %in% c(baseline, treated), ]
+  
+  # Create a factor to distinguish between baseline and treated groups
+  pair_data$group <- factor(ifelse(pair_data$Treatment == baseline, "baseline", "treated"))
+  names(pair_data)[names(pair_data) == "viral load"] <- "viral_load"
+  # Check if there are enough data points to proceed
+  if(nrow(pair_data) > 1) {
+    # Design matrix including Timepoint as a factor and HIV status
+    design <- model.matrix(~0+ group + Timepoint + HIV  +viral_load, data = pair_data)
+    
+    # Voom transformation
+    v <- voom(t(pair_data[, !(names(pair_data) %in% c("PID", "HIV", "gender", "Timepoint","viral_load", "Treatment", "group"))]), 
+              design, plot = FALSE)
+    
+    # Fit the linear model
+    corfit <- duplicateCorrelation(v, design, block = pair_data$PID)
+    fit <- lmFit(v, design, block = pair_data$PID, correlation = corfit$consensus)
+    
+    # Specify the correct contrast based on the baseline and treated groups
+    contrast.matrix <- makeContrasts(grouptreated - groupbaseline, levels = design)
+    
+    # Apply contrasts
+    fit2 <- contrasts.fit(fit, contrast.matrix)
+    fit2 <- eBayes(fit2)
+    
+    # Store results, specifying treatment pair
+    results_key <- paste(baseline, "vs", treated, sep="_")
+    results_list_paired[[results_key]] <- topTable(fit2, adjust="BH", number=1000)
+  }
+}
+
+
+
+## VOlcano Plots
+results_list_paired$`untreated_vs_IL15`$feature<- rownames(results_list_paired$`untreated_vs_IL15`)
+results_list_paired$`untreated_vs_IL15`$abs_logFC<- abs(results_list_paired$`untreated_vs_IL15`$logFC)
+
+results_list_paired$`CEM_vs_CEM+IL15`$feature<- rownames(results_list_paired$`CEM_vs_CEM+IL15`)
+results_list_paired$`CEM_vs_CEM+IL15`$abs_logFC<- abs(results_list_paired$`CEM_vs_CEM+IL15`$logFC)
+
+results_list_paired$`HUT78_vs_HUT78+IL15`$feature<- rownames(results_list_paired$`HUT78_vs_HUT78+IL15`)
+results_list_paired$`HUT78_vs_HUT78+IL15`$abs_logFC<- abs(results_list_paired$`HUT78_vs_HUT78+IL15`$logFC)
+
+results_list_paired$`K562_vs_K562+IL15`$feature<- rownames(results_list_paired$`K562_vs_K562+IL15`)
+results_list_paired$`K562_vs_K562+IL15`$abs_logFC<- abs(results_list_paired$`K562_vs_K562+IL15`$logFC)
+
+### Untreated
+library(ggrepel)
+# Create the volcano plot and add labels for significant points
+Untreated_volcano_plot <- ggplot(results_list_paired$`untreated_vs_IL15`, 
+                                 aes(x = logFC, y = -log10(P.Value), 
+                                     text = paste("Cell Type:", feature, 
+                                                  "<br>LogFC:", logFC, 
+                                                  "<br>Adj. P-Val:", adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), alpha = 0.5) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey50")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot NK Cell Fold Change  IL15 vs Untreated", 
+       x = "Log2 Fold Change (IL15 vs Untreated)", y = "-Log10 P-value") +
+  
+  # Add labels for significant points with lines connecting them
+  geom_label_repel(aes(label = ifelse(adj.P.Val < 0.05, as.character(feature), "")), 
+                   size = 3, color = "black", 
+                   box.padding = 0.35, point.padding = 0.5, 
+                   segment.color = "grey50", max.overlaps = 15)  # Adjust max.overlaps as needed
+
+# Print the plot
+print(Untreated_volcano_plot)
+ggsave("Untreated_volcano_plot.png", plot = Untreated_volcano_plot, width = 10, height = 8, dpi = 300,bg='white')
+
+
+### CEM
+
+# Create the volcano plot and add labels for significant points
+CEM_volcano_plot <- ggplot(results_list_paired$`CEM_vs_CEM+IL15`, 
+                                 aes(x = logFC, y = -log10(P.Value), 
+                                     text = paste("Cell Type:", feature, 
+                                                  "<br>LogFC:", logFC, 
+                                                  "<br>Adj. P-Val:", adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), alpha = 0.5) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey50")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot NK Cell Fold Change for CEM+IL15 vs CEM ", 
+       x = "Log2 Fold Change (CEM+IL15 vs CEM)", y = "-Log10 P-value") +
+  
+  # Add labels for significant points with lines connecting them
+  geom_label_repel(aes(label = ifelse(adj.P.Val < 0.05, as.character(feature), "")), 
+                   size = 3, color = "black", 
+                   box.padding = 0.35, point.padding = 0.5, 
+                   segment.color = "grey50", max.overlaps = 15)  # Adjust max.overlaps as needed
+
+
+# Print the plot
+print(CEM_volcano_plot)
+ggsave("CEM_volcano_plot.png", plot = CEM_volcano_plot, width = 10, height = 8, dpi = 300,bg='white')
+
+### HUT
+
+# Create the volcano plot and add labels for significant points
+HUT_volcano_plot <- ggplot(results_list_paired$`HUT78_vs_HUT78+IL15`, 
+                                 aes(x = logFC, y = -log10(P.Value), 
+                                     text = paste("Cell Type:", feature, 
+                                                  "<br>LogFC:", logFC, 
+                                                  "<br>Adj. P-Val:", adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), size=3,alpha = 0.7) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey50")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot NK Cell Fold Change  HUT78+IL15 vs HUT78", 
+       x = "Log2 Fold Change (HUT78+IL15 vs HUT78)", y = "-Log10 P-value") +
+  
+  # Add labels for significant points with lines connecting them
+  geom_label_repel(aes(label = ifelse(adj.P.Val < 0.05, as.character(feature), "")), 
+                   size = 5, color = "black", 
+                   box.padding = 0.35, point.padding = 0.5, 
+                   segment.color = "grey50", max.overlaps = 15)  # Adjust max.overlaps as needed
+
+# Print the plot
+print(HUT_volcano_plot)
+ggsave("HUT_volcano_plot_large.png", plot = HUT_volcano_plot, width = 10, height = 8, dpi = 300,bg='white')
+
+### K562
+
+# Create the volcano plot and add labels for significant points
+K562_volcano_plot <- ggplot(results_list_paired$`K562_vs_K562+IL15`, 
+                                 aes(x = logFC, y = -log10(P.Value), 
+                                     text = paste("Cell Type:", feature, 
+                                                  "<br>LogFC:", logFC, 
+                                                  "<br>Adj. P-Val:", adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), alpha = 0.5) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey50")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot NK Cell Fold Change  K562+IL15 vs K562", 
+       x = "Log2 Fold Change (K562+IL15 vs K562)", y = "-Log10 P-value") +
+  
+  # Add labels for significant points
+  geom_label_repel(aes(label = ifelse(adj.P.Val < 0.05, as.character(feature), "")), 
+                   size = 3, color = "black", 
+                   box.padding = 0.35, point.padding = 0.5, 
+                   segment.color = "grey50", max.overlaps = 15)  # Adjust max.overlaps as needed
+
+# Print the plot
+print(K562_volcano_plot)
+ggsave("K562_volcano_plot.png", plot = K562_volcano_plot, width = 10, height = 8, dpi = 300,bg='white')
+
+
+
+
+
+######################
+### Fix missing VL Value
+
 
 
 
