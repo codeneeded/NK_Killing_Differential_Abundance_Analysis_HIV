@@ -1882,4 +1882,92 @@ CEM_volcano_plot <- ggplot(results_list$`CEM_vs_CEM+IL15`, aes(x = logFC, y = -l
 
 CEM_volcano_plot <- ggplotly(CEM_volcano_plot, tooltip = "text")
 
-CEM_volcano_plot
+#### Correlation Plots ####
+# Load necessary packages
+library(Hmisc)
+library(corrplot)
+
+setwd("C:/Users/axi313/Documents/NK_Killing_Differential_Abundance_Analysis_HIV/Corrplots")
+
+# Subset the dataframe
+droplevels(tara_Freq)
+levels(tara_Freq$Treatment)
+subset_data <- tara_Freq[, c(20:22, 56, 90:109)]
+
+# Compute correlation matrix and p-values
+cor_matrix <- rcorr(as.matrix(subset_data))
+
+# Extract correlation coefficients and p-values
+cor_values <- cor_matrix$r
+p_values <- cor_matrix$P
+p_values[is.na(p_values)] <- 1
+
+# Create a significance level threshold (e.g., p < 0.05)
+sig_level <- 0.05
+
+# Function to annotate the correlation matrix
+stars <- function(p) {
+  ifelse(p < .001, "***", ifelse(p < .01, "**", ifelse(p < .05, "*", "")))
+}
+
+# Apply the star function to p-values
+cor_with_stars <- matrix(paste(format(round(cor_values, 2), nsmall = 2), stars(p_values), sep=""), 
+                         nrow=nrow(cor_values))
+
+# Remove the stars in the diagonal
+diag(cor_with_stars) <- format(round(diag(cor_values), 2), nsmall = 2)
+###
+
+
+png("correlation_plot_all.png", width = 4000, height = 2400, res = 300)
+
+corrplot(cor_values, method = "color", 
+         type = "lower",  # Show only the lower triangle
+         col = colorRampPalette(c("darkblue", "white", "darkred"))(200),  # Blue for low, red for high correlations
+         tl.col = "black", tl.srt = 45, tl.cex = 0.8,  # Smaller text for labels
+         p.mat = p_values, sig.level = sig_level, 
+         insig = "label_sig", # Show significance stars
+         pch.col = "red", pch.cex = 1.5, # Customize star color and size
+         cl.cex = 0.8,  # Smaller text in color legend
+         mar = c(0, 0, 0, 0))  # Adjust margins for larger boxes
+# Add the title
+title(main = "Corrplot: All Groups", cex.main = 1)
+# Close the device to save the file
+dev.off()
+#####
+# Filter out specific treatments
+filtered_treatments <- grep("^(9218|9228|.+\\+9218|.+\\+9228)$", levels(tara_Freq$Treatment), invert = TRUE, value = TRUE)
+# Subset the data based on filtered treatments
+tara_Freq_filtered <- tara_Freq[tara_Freq$Treatment %in% filtered_treatments, ]
+
+# Loop through each remaining treatment
+for (treatment in filtered_treatments) {
+  
+  # Subset data for the current treatment
+  subset_data <- tara_Freq_filtered[tara_Freq_filtered$Treatment == treatment, c(20:22, 56, 90:109)]
+  
+  # Remove rows with NA values
+  subset_data <- na.omit(subset_data)
+  
+  # Compute correlation matrix and p-values
+  cor_matrix <- rcorr(as.matrix(subset_data))
+  cor_values <- cor_matrix$r
+  p_values <- cor_matrix$P
+  p_values[is.na(p_values)] <- 1
+  # Generate and save the correlation plot
+  png(paste0("correlation_plot_", treatment, ".png"), width = 4000, height = 2400, res = 300)
+  
+  corrplot(cor_values, method = "color", 
+           type = "lower",  # Show only the lower triangle
+           col = colorRampPalette(c("darkblue", "white", "darkred"))(200),  # Blue for low, red for high correlations
+           tl.col = "black", tl.srt = 45, tl.cex = 0.8,  # Smaller text for labels
+           p.mat = p_values, sig.level = sig_level, 
+           insig = "label_sig", # Show significance stars
+           pch.col = "red", pch.cex = 1.5, # Customize star color and size
+           cl.cex = 0.8,  # Smaller text in color legend
+           mar = c(0, 0, 0, 0))  # Adjust margins for larger boxes
+  
+  title(main = paste("Corrplot: Treatment", treatment), cex.main = 1.5)
+  
+  dev.off()
+}
